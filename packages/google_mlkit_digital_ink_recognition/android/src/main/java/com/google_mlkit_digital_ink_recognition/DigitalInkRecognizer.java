@@ -34,9 +34,8 @@ public class DigitalInkRecognizer implements MethodChannel.MethodCallHandler {
     private final Map<String, com.google.mlkit.vision.digitalink.DigitalInkRecognizer> instances = new HashMap<>();
     private final GenericModelManager genericModelManager = new GenericModelManager();
 
-    // Background thread executor for heavy ML Kit operations
-    private final ExecutorService backgroundExecutor = Executors.newFixedThreadPool(2);
-    // Handler to post results back to main thread
+    // Use a single background executor for all operations
+    private final ExecutorService backgroundExecutor = Executors.newFixedThreadPool(4);
     private final Handler mainHandler = new Handler(Looper.getMainLooper());
 
     @Override
@@ -44,13 +43,18 @@ public class DigitalInkRecognizer implements MethodChannel.MethodCallHandler {
         String method = call.method;
         switch (method) {
             case START:
-                handleDetection(call, result);
+                // Offload recognition to background immediately
+                backgroundExecutor.execute(() -> handleDetection(call, result));
                 break;
             case CLOSE:
-                closeDetector(call);
+                backgroundExecutor.execute(() -> {
+                    closeDetector(call);
+                    mainHandler.post(() -> result.success(null));
+                });
                 break;
             case MANAGE:
-                manageModel(call, result);
+                // Offload model management to background
+                backgroundExecutor.execute(() -> manageModel(call, result));
                 break;
             default:
                 result.notImplemented();
@@ -58,25 +62,12 @@ public class DigitalInkRecognizer implements MethodChannel.MethodCallHandler {
         }
     }
 
-    private void handleDetection(MethodCall call, final MethodChannel.Result result) {
-        // Move the entire heavy operation to background thread
-        backgroundExecutor.execute(() -> {
-            try {
-                performRecognitionInBackground(call, result);
-            } catch (Exception e) {
-                // Post error back to main thread
-                mainHandler.post(() ->
-                        result.error("Recognition Error", e.getMessage(), null)
-                );
-            }
-        });
-    }
-
-    private void performRecognitionInBackground(MethodCall call, final MethodChannel.Result result) {
+    private void handleDetection(MethodCall call, MethodChannel.Result result) {
         String tag = call.argument("model");
         DigitalInkRecognitionModel model = getModel(tag, result);
         if (model == null) return;
 
+        // Check model status in background
         if (!genericModelManager.isModelDownloaded(model)) {
             mainHandler.post(() ->
                     result.error("Model Error", "Model has not been downloaded yet", null)
@@ -87,7 +78,6 @@ public class DigitalInkRecognizer implements MethodChannel.MethodCallHandler {
         String id = call.argument("id");
         com.google.mlkit.vision.digitalink.DigitalInkRecognizer recognizer;
 
-        // Synchronize access to the instances map
         synchronized (instances) {
             recognizer = instances.get(id);
             if (recognizer == null) {
@@ -98,7 +88,6 @@ public class DigitalInkRecognizer implements MethodChannel.MethodCallHandler {
             }
         }
 
-        // Build Ink object in background thread
         Ink ink = buildInkFromMethodCall(call);
         if (ink == null) {
             mainHandler.post(() ->
@@ -107,36 +96,27 @@ public class DigitalInkRecognizer implements MethodChannel.MethodCallHandler {
             return;
         }
 
-        // Build recognition context in background thread
         RecognitionContext context = buildRecognitionContext(call);
 
-        // Perform recognition
+        // Execute recognition in background
         if (context != null) {
             recognizer.recognize(ink, context)
-                    .addOnSuccessListener(recognitionResult -> {
-                        // Process results in background thread
-                        backgroundExecutor.execute(() -> {
-                            List<Map<String, Object>> processedResults = processRecognitionResult(recognitionResult);
-                            // Post results back to main thread
-                            mainHandler.post(() -> result.success(processedResults));
-                        });
+                    .addOnSuccessListener(backgroundExecutor, recognitionResult -> {
+                        List<Map<String, Object>> processedResults = processRecognitionResult(recognitionResult);
+                        mainHandler.post(() -> result.success(processedResults));
                     })
-                    .addOnFailureListener(e -> {
+                    .addOnFailureListener(backgroundExecutor, e -> {
                         mainHandler.post(() ->
                                 result.error("Recognition Error", e.toString(), null)
                         );
                     });
         } else {
             recognizer.recognize(ink)
-                    .addOnSuccessListener(recognitionResult -> {
-                        // Process results in background thread
-                        backgroundExecutor.execute(() -> {
-                            List<Map<String, Object>> processedResults = processRecognitionResult(recognitionResult);
-                            // Post results back to main thread
-                            mainHandler.post(() -> result.success(processedResults));
-                        });
+                    .addOnSuccessListener(backgroundExecutor, recognitionResult -> {
+                        List<Map<String, Object>> processedResults = processRecognitionResult(recognitionResult);
+                        mainHandler.post(() -> result.success(processedResults));
                     })
-                    .addOnFailureListener(e -> {
+                    .addOnFailureListener(backgroundExecutor, e -> {
                         mainHandler.post(() ->
                                 result.error("Recognition Error", e.toString(), null)
                         );
@@ -228,40 +208,53 @@ public class DigitalInkRecognizer implements MethodChannel.MethodCallHandler {
             instances.remove(id);
         }
 
-        // Close recognizer on background thread to avoid blocking UI
-        backgroundExecutor.execute(() -> {
-            recognizer.close();
-        });
+        recognizer.close();
     }
 
-    private void manageModel(MethodCall call, final MethodChannel.Result result) {
+    private void manageModel(MethodCall call, MethodChannel.Result result) {
         String tag = call.argument("model");
         DigitalInkRecognitionModel model = getModel(tag, result);
         if (model != null) {
-            genericModelManager.manageModel(model, call, result);
+            // Execute model management in background
+            genericModelManager.manageModel(model, call, new MethodChannel.Result() {
+                @Override
+                public void success(Object o) {
+                    mainHandler.post(() -> result.success(o));
+                }
+
+                @Override
+                public void error(String errorCode, String errorMessage, Object errorDetails) {
+                    mainHandler.post(() -> result.error(errorCode, errorMessage, errorDetails));
+                }
+
+                @Override
+                public void notImplemented() {
+                    mainHandler.post(result::notImplemented);
+                }
+            });
         }
     }
 
-    private DigitalInkRecognitionModel getModel(String tag, final MethodChannel.Result result) {
-        DigitalInkRecognitionModelIdentifier modelIdentifier;
+    private DigitalInkRecognitionModel getModel(String tag, MethodChannel.Result result) {
         try {
-            modelIdentifier = DigitalInkRecognitionModelIdentifier.fromLanguageTag(tag);
+            DigitalInkRecognitionModelIdentifier modelIdentifier =
+                    DigitalInkRecognitionModelIdentifier.fromLanguageTag(tag);
+
+            if (modelIdentifier == null) {
+                mainHandler.post(() ->
+                        result.error("Model Error", "Invalid model identifier: " + tag, null)
+                );
+                return null;
+            }
+            return DigitalInkRecognitionModel.builder(modelIdentifier).build();
         } catch (MlKitException e) {
             mainHandler.post(() ->
-                    result.error("Failed to create model identifier", e.toString(), null)
+                    result.error("Model Error", "Failed to create model: " + e.getMessage(), null)
             );
             return null;
         }
-        if (modelIdentifier == null) {
-            mainHandler.post(() ->
-                    result.error("Model Identifier error", "No model was found", null)
-            );
-            return null;
-        }
-        return DigitalInkRecognitionModel.builder(modelIdentifier).build();
     }
 
-    // Clean up resources when plugin is destroyed
     public void dispose() {
         backgroundExecutor.shutdown();
         synchronized (instances) {
