@@ -67,61 +67,73 @@ public class DigitalInkRecognizer implements MethodChannel.MethodCallHandler {
         DigitalInkRecognitionModel model = getModel(tag, result);
         if (model == null) return;
 
-        // Check model status in background
-        if (!genericModelManager.isModelDownloaded(model)) {
-            mainHandler.post(() ->
-                    result.error("Model Error", "Model has not been downloaded yet", null)
-            );
-            return;
-        }
-
         String id = call.argument("id");
-        com.google.mlkit.vision.digitalink.DigitalInkRecognizer recognizer;
 
-        synchronized (instances) {
-            recognizer = instances.get(id);
-            if (recognizer == null) {
-                recognizer = DigitalInkRecognition.getClient(
-                        DigitalInkRecognizerOptions.builder(model).build()
-                );
-                instances.put(id, recognizer);
+        // Check model status asynchronously using the callback
+        genericModelManager.isModelDownloaded(model, new GenericModelManager.CheckModelIsDownloadedCallback() {
+            @Override
+            public void onCheckResult(Boolean isDownloaded) {
+                if (!isDownloaded) {
+                    mainHandler.post(() ->
+                            result.error("Model Error", "Model has not been downloaded yet", null)
+                    );
+                    return;
+                }
+
+                com.google.mlkit.vision.digitalink.DigitalInkRecognizer recognizer;
+                synchronized (instances) {
+                    recognizer = instances.get(id);
+                    if (recognizer == null) {
+                        recognizer = DigitalInkRecognition.getClient(
+                                DigitalInkRecognizerOptions.builder(model).build()
+                        );
+                        instances.put(id, recognizer);
+                    }
+                }
+
+                Ink ink = buildInkFromMethodCall(call);
+                if (ink == null) {
+                    mainHandler.post(() ->
+                            result.error("Ink Error", "Failed to build ink object", null)
+                    );
+                    return;
+                }
+
+                RecognitionContext context = buildRecognitionContext(call);
+                final com.google.mlkit.vision.digitalink.DigitalInkRecognizer finalRecognizer = recognizer;
+
+                if (context != null) {
+                    finalRecognizer.recognize(ink, context)
+                            .addOnSuccessListener(backgroundExecutor, recognitionResult -> {
+                                List<Map<String, Object>> processedResults = processRecognitionResult(recognitionResult);
+                                mainHandler.post(() -> result.success(processedResults));
+                            })
+                            .addOnFailureListener(backgroundExecutor, e -> {
+                                mainHandler.post(() ->
+                                        result.error("Recognition Error", e.toString(), null)
+                                );
+                            });
+                } else {
+                    finalRecognizer.recognize(ink)
+                            .addOnSuccessListener(backgroundExecutor, recognitionResult -> {
+                                List<Map<String, Object>> processedResults = processRecognitionResult(recognitionResult);
+                                mainHandler.post(() -> result.success(processedResults));
+                            })
+                            .addOnFailureListener(backgroundExecutor, e -> {
+                                mainHandler.post(() ->
+                                        result.error("Recognition Error", e.toString(), null)
+                                );
+                            });
+                }
             }
-        }
 
-        Ink ink = buildInkFromMethodCall(call);
-        if (ink == null) {
-            mainHandler.post(() ->
-                    result.error("Ink Error", "Failed to build ink object", null)
-            );
-            return;
-        }
-
-        RecognitionContext context = buildRecognitionContext(call);
-
-        // Execute recognition in background
-        if (context != null) {
-            recognizer.recognize(ink, context)
-                    .addOnSuccessListener(backgroundExecutor, recognitionResult -> {
-                        List<Map<String, Object>> processedResults = processRecognitionResult(recognitionResult);
-                        mainHandler.post(() -> result.success(processedResults));
-                    })
-                    .addOnFailureListener(backgroundExecutor, e -> {
-                        mainHandler.post(() ->
-                                result.error("Recognition Error", e.toString(), null)
-                        );
-                    });
-        } else {
-            recognizer.recognize(ink)
-                    .addOnSuccessListener(backgroundExecutor, recognitionResult -> {
-                        List<Map<String, Object>> processedResults = processRecognitionResult(recognitionResult);
-                        mainHandler.post(() -> result.success(processedResults));
-                    })
-                    .addOnFailureListener(backgroundExecutor, e -> {
-                        mainHandler.post(() ->
-                                result.error("Recognition Error", e.toString(), null)
-                        );
-                    });
-        }
+            @Override
+            public void onError(Exception e) {
+                mainHandler.post(() ->
+                        result.error("Model Error", "Failed to check model status: " + e.getMessage(), null)
+                );
+            }
+        });
     }
 
     private Ink buildInkFromMethodCall(MethodCall call) {
