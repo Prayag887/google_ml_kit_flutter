@@ -49,23 +49,19 @@ public class DigitalInkRecognizer implements MethodChannel.MethodCallHandler {
         }
     }
 
-    private void handleDetection(MethodCall call, final MethodChannel.Result result) {
-        String tag = call.argument("model");
-        DigitalInkRecognitionModel model = getModel(tag, result);
-        if (model == null) return;
+   private void handleDetection(MethodCall call, final MethodChannel.Result result) {
+    String tag = call.argument("model");
+    DigitalInkRecognitionModel model = getModel(tag, result);
+    if (model == null) return;
 
-        // isModelDownloaded() blocks internally (uses Tasks.await) so run it
-        // off the main thread to avoid ANR, then hop back to report the result.
-        executor.execute(() -> {
-            Boolean downloaded = genericModelManager.isModelDownloaded(model);
-
-            if (downloaded == null || !downloaded) {
-                mainHandler.post(() ->
-                        result.error("Model Error", "Model has not been downloaded yet", null));
+    genericModelManager.isModelDownloaded(model, new GenericModelManager.CheckModelIsDownloadedCallback() {
+        @Override
+        public void onCheckResult(Boolean isDownloaded) {
+            if (!isDownloaded) {
+                result.error("Model Error", "Model has not been downloaded yet", null);
                 return;
             }
 
-            // Build the recognizer on the background thread too (safe to do so)
             String id = call.argument("id");
             com.google.mlkit.vision.digitalink.DigitalInkRecognizer recognizer;
             synchronized (instances) {
@@ -77,7 +73,6 @@ public class DigitalInkRecognizer implements MethodChannel.MethodCallHandler {
                 }
             }
 
-            // Parse ink data
             Map<String, Object> inkMap = call.argument("ink");
             List<Map<String, Object>> strokeList =
                     (List<Map<String, Object>>) inkMap.get("strokes");
@@ -97,14 +92,12 @@ public class DigitalInkRecognizer implements MethodChannel.MethodCallHandler {
             }
             Ink ink = inkBuilder.build();
 
-            // Build optional recognition context
             RecognitionContext context = null;
             Map<String, Object> contextMap = call.argument("context");
             if (contextMap != null) {
                 RecognitionContext.Builder builder = RecognitionContext.builder();
                 String preContext = (String) contextMap.get("preContext");
                 builder.setPreContext(preContext != null ? preContext : "");
-
                 Map<String, Object> writingAreaMap =
                         (Map<String, Object>) contextMap.get("writingArea");
                 if (writingAreaMap != null) {
@@ -115,22 +108,25 @@ public class DigitalInkRecognizer implements MethodChannel.MethodCallHandler {
                 context = builder.build();
             }
 
-            // Fire recognition — ML Kit posts its own callbacks on the main thread
             final RecognitionContext finalContext = context;
             final com.google.mlkit.vision.digitalink.DigitalInkRecognizer finalRecognizer = recognizer;
-            mainHandler.post(() -> {
-                if (finalContext != null) {
-                    finalRecognizer.recognize(ink, finalContext)
-                            .addOnSuccessListener(r -> process(r, result))
-                            .addOnFailureListener(e -> result.error("Recognition Error", e.toString(), null));
-                } else {
-                    finalRecognizer.recognize(ink)
-                            .addOnSuccessListener(r -> process(r, result))
-                            .addOnFailureListener(e -> result.error("Recognition Error", e.toString(), null));
-                }
-            });
-        });
-    }
+            if (finalContext != null) {
+                finalRecognizer.recognize(ink, finalContext)
+                        .addOnSuccessListener(r -> process(r, result))
+                        .addOnFailureListener(e -> result.error("Recognition Error", e.toString(), null));
+            } else {
+                finalRecognizer.recognize(ink)
+                        .addOnSuccessListener(r -> process(r, result))
+                        .addOnFailureListener(e -> result.error("Recognition Error", e.toString(), null));
+            }
+        }
+
+        @Override
+        public void onError(Exception e) {
+            result.error("Model Error", "Failed to check model: " + e.toString(), null);
+        }
+    });
+}
 
     private void process(RecognitionResult recognitionResult, MethodChannel.Result result) {
         List<Map<String, Object>> candidatesList =
