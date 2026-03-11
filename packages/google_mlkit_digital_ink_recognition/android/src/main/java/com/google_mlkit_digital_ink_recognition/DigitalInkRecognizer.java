@@ -52,82 +52,79 @@ public class DigitalInkRecognizer implements MethodChannel.MethodCallHandler {
     private void handleDetection(MethodCall call, final MethodChannel.Result result) {
         String tag = call.argument("model");
         DigitalInkRecognitionModel model = getModel(tag, result);
-        if (model == null)
-            return;
-        if (!genericModelManager.isModelDownloaded(model)) {
-            result.error("Model Error", "Model has not been downloaded yet ", null);
-            return;
-        }
+        if (model == null) return;
 
-        String id = call.argument("id");
-        com.google.mlkit.vision.digitalink.DigitalInkRecognizer recognizer = instances.get(id);
-        if (recognizer == null) {
-            recognizer = DigitalInkRecognition.getClient(DigitalInkRecognizerOptions.builder(model).build());
-            instances.put(id, recognizer);
-        }
+        // FIX 1: isModelDownloaded now requires a callback — use it async,
+        // then proceed with recognition inside the callback on success.
+        genericModelManager.isModelDownloaded(model, (isDownloaded) -> {
+            if (!isDownloaded) {
+                result.error("Model Error", "Model has not been downloaded yet", null);
+                return;
+            }
 
-        Map<String, Object> inkMap = call.argument("ink");
-        List<Map<String, Object>> strokeList = (List<Map<String, Object>>) inkMap.get("strokes");
-        Ink.Builder inkBuilder = Ink.builder();
-        for (final Map<String, Object> strokeMap : strokeList) {
-            Ink.Stroke.Builder strokeBuilder = Ink.Stroke.builder();
-            List<Map<String, Object>> pointsList = (List<Map<String, Object>>) strokeMap.get("points");
-            for (final Map<String, Object> point : pointsList) {
-                float x = (float) (double) point.get("x");
-                float y = (float) (double) point.get("y");
-                Object t0 = point.get("t");
-                long t;
-                if (t0 instanceof Integer) {
-                    t = (int) t0;
-                } else {
-                    t = (long) t0;
+            String id = call.argument("id");
+            com.google.mlkit.vision.digitalink.DigitalInkRecognizer recognizer = instances.get(id);
+            if (recognizer == null) {
+                recognizer = DigitalInkRecognition.getClient(
+                        DigitalInkRecognizerOptions.builder(model).build());
+                instances.put(id, recognizer);
+            }
+
+            Map<String, Object> inkMap = call.argument("ink");
+            List<Map<String, Object>> strokeList =
+                    (List<Map<String, Object>>) inkMap.get("strokes");
+            Ink.Builder inkBuilder = Ink.builder();
+            for (final Map<String, Object> strokeMap : strokeList) {
+                Ink.Stroke.Builder strokeBuilder = Ink.Stroke.builder();
+                List<Map<String, Object>> pointsList =
+                        (List<Map<String, Object>>) strokeMap.get("points");
+                for (final Map<String, Object> point : pointsList) {
+                    float x = (float) (double) point.get("x");
+                    float y = (float) (double) point.get("y");
+                    Object t0 = point.get("t");
+                    long t = (t0 instanceof Integer) ? (int) t0 : (long) t0;
+                    strokeBuilder.addPoint(Ink.Point.create(x, y, t));
                 }
-                Ink.Point strokePoint = Ink.Point.create(x, y, t);
-                strokeBuilder.addPoint(strokePoint);
+                inkBuilder.addStroke(strokeBuilder.build());
             }
-            inkBuilder.addStroke(strokeBuilder.build());
-        }
-        Ink ink = inkBuilder.build();
+            Ink ink = inkBuilder.build();
 
-        RecognitionContext context = null;
-        Map<String, Object> contextMap = call.argument("context");
-        if (contextMap != null) {
-            RecognitionContext.Builder builder = RecognitionContext.builder();
-            String preContext = (String) contextMap.get("preContext");
-            if (preContext != null) {
-                builder.setPreContext(preContext);
+            RecognitionContext context = null;
+            Map<String, Object> contextMap = call.argument("context");
+            if (contextMap != null) {
+                RecognitionContext.Builder builder = RecognitionContext.builder();
+                String preContext = (String) contextMap.get("preContext");
+                builder.setPreContext(preContext != null ? preContext : "");
+
+                Map<String, Object> writingAreaMap =
+                        (Map<String, Object>) contextMap.get("writingArea");
+                if (writingAreaMap != null) {
+                    float width  = (float) (double) writingAreaMap.get("width");
+                    float height = (float) (double) writingAreaMap.get("height");
+                    builder.setWritingArea(new WritingArea(width, height));
+                }
+                context = builder.build();
+            }
+
+            final com.google.mlkit.vision.digitalink.DigitalInkRecognizer finalRecognizer = recognizer;
+            if (context != null) {
+                finalRecognizer.recognize(ink, context)
+                        .addOnSuccessListener(r -> process(r, result))
+                        .addOnFailureListener(e -> result.error("Recognition Error", e.toString(), null));
             } else {
-                builder.setPreContext("");
+                finalRecognizer.recognize(ink)
+                        .addOnSuccessListener(r -> process(r, result))
+                        .addOnFailureListener(e -> result.error("Recognition Error", e.toString(), null));
             }
-
-            Map<String, Object> writingAreaMap = (Map<String, Object>) contextMap.get("writingArea");
-            if (writingAreaMap != null) {
-                float width = (float) (double) writingAreaMap.get("width");
-                float height = (float) (double) writingAreaMap.get("height");
-                builder.setWritingArea(new WritingArea(width, height));
-            }
-
-            context = builder.build();
-        }
-
-        if (context != null) {
-            recognizer.recognize(ink, context)
-                    .addOnSuccessListener(recognitionResult -> process(recognitionResult, result))
-                    .addOnFailureListener(e -> result.error("recognition Error", e.toString(), null));
-        } else {
-            recognizer.recognize(ink)
-                    .addOnSuccessListener(recognitionResult -> process(recognitionResult, result))
-                    .addOnFailureListener(e -> result.error("recognition Error", e.toString(), null));
-        }
+        });
     }
 
     private void process(RecognitionResult recognitionResult, final MethodChannel.Result result) {
-        List<Map<String, Object>> candidatesList = new ArrayList<>(recognitionResult.getCandidates().size());
+        List<Map<String, Object>> candidatesList =
+                new ArrayList<>(recognitionResult.getCandidates().size());
         for (RecognitionCandidate candidate : recognitionResult.getCandidates()) {
             Map<String, Object> candidateData = new HashMap<>();
-            double score = 0;
-            if (candidate.getScore() != null)
-                score = candidate.getScore().doubleValue();
+            double score = candidate.getScore() != null ? candidate.getScore().doubleValue() : 0;
             candidateData.put("text", candidate.getText());
             candidateData.put("score", score);
             candidatesList.add(candidateData);
@@ -138,8 +135,7 @@ public class DigitalInkRecognizer implements MethodChannel.MethodCallHandler {
     private void closeDetector(MethodCall call) {
         String id = call.argument("id");
         com.google.mlkit.vision.digitalink.DigitalInkRecognizer recognizer = instances.get(id);
-        if (recognizer == null)
-            return;
+        if (recognizer == null) return;
         recognizer.close();
         instances.remove(id);
     }
@@ -147,7 +143,18 @@ public class DigitalInkRecognizer implements MethodChannel.MethodCallHandler {
     private void manageModel(MethodCall call, final MethodChannel.Result result) {
         String tag = call.argument("model");
         DigitalInkRecognitionModel model = getModel(tag, result);
+        if (model == null) return;
         genericModelManager.manageModel(model, call, result);
+    }
+
+    // FIX 2: Added dispose() so the plugin class can call it on detach/teardown.
+    public void dispose() {
+        for (com.google.mlkit.vision.digitalink.DigitalInkRecognizer recognizer : instances.values()) {
+            try {
+                recognizer.close();
+            } catch (Exception ignored) {}
+        }
+        instances.clear();
     }
 
     private DigitalInkRecognitionModel getModel(String tag, final MethodChannel.Result result) {

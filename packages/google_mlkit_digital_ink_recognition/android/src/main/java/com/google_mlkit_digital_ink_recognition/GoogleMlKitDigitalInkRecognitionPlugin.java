@@ -14,22 +14,28 @@ public class GoogleMlKitDigitalInkRecognitionPlugin implements FlutterPlugin {
     private static final String channelName = "google_mlkit_digital_ink_recognizer";
     private final ExecutorService executor = Executors.newSingleThreadExecutor();
     private final Handler mainThreadHandler = new Handler(Looper.getMainLooper());
-    private boolean isDisposed = false;
+    // FIX 3: volatile so the background thread sees the flag immediately
+    private volatile boolean isDisposed = false;
 
     @Override
     public void onAttachedToEngine(@NonNull FlutterPluginBinding flutterPluginBinding) {
+        isDisposed = false;
         channel = new MethodChannel(flutterPluginBinding.getBinaryMessenger(), channelName);
 
-        // Initialize in background thread
+        // Capture channel locally — field may be nulled by onDetachedFromEngine
+        // before the background thread posts back to the main thread.
+        final MethodChannel capturedChannel = channel;
+
         executor.execute(() -> {
-            DigitalInkRecognizer recognizer = new DigitalInkRecognizer();
+            final DigitalInkRecognizer recognizer = new DigitalInkRecognizer();
 
             mainThreadHandler.post(() -> {
                 if (isDisposed) {
+                    // Engine detached before we finished init — clean up quietly.
                     recognizer.dispose();
                 } else {
                     digitalInkRecognizer = recognizer;
-                    channel.setMethodCallHandler(digitalInkRecognizer);
+                    capturedChannel.setMethodCallHandler(digitalInkRecognizer);
                 }
             });
         });
@@ -38,13 +44,18 @@ public class GoogleMlKitDigitalInkRecognitionPlugin implements FlutterPlugin {
     @Override
     public void onDetachedFromEngine(@NonNull FlutterPluginBinding binding) {
         isDisposed = true;
-        channel.setMethodCallHandler(null);
-        channel = null;
 
-        // Shutdown executor and clean up
+        // Null-guard: channel could theoretically already be null if
+        // onAttachedToEngine never completed successfully.
+        if (channel != null) {
+            channel.setMethodCallHandler(null);
+            channel = null;
+        }
+
         executor.shutdownNow();
+
         if (digitalInkRecognizer != null) {
-            digitalInkRecognizer.dispose();
+            digitalInkRecognizer.dispose(); // now exists — FIX 2
             digitalInkRecognizer = null;
         }
     }
